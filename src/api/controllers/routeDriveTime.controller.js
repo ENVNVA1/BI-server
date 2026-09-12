@@ -1,0 +1,311 @@
+'use strict';
+const { models } = require('../../models');
+const { buildEnvelope } = require('../lib/envelope');
+const { getPaging, pageMeta, sliceArray } = require('../lib/pagination');
+const { getSourceDb } = require('../../config/database');
+const { inFilterRange, filterDayKey } = require('../lib/checkoutDate');
+const { parseTs, signedMinutesBetween } = require('../lib/stopTimes');
+
+const { CompanyDistance, Tenant } = models;
+const clean = (v) => { const s = v == null ? '' : String(v).trim(); return s || undefined; };
+const round = (n, d = 1) => { const f = 10 ** d; return Math.round(n * f) / f; };
+const normName = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+const customerIdFromLink = (link) => { const m = String(link || '').match(/customerdetail\/([^/?#]+)/i); return m ? decodeURIComponent(m[1]) : null; };
+const CLOSED = { $or: [{ invoiceType: 'closed' }, { status: { $in: ['Closed', 'Completed'] } }] };
+
+const dayKey = (d) => (d ? new Date(d).toISOString().slice(0, 10) : null);
+
+function dateBound(dk, days) {
+  const d = new Date(`${dk}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d;
+}
+function datePrefilter(from, to) {
+  if (!from && !to) return null;
+  const range = {};
+  if (from) range.$gte = dateBound(from, -2);
+  if (to) range.$lte = dateBound(to, 2);
+  return { dateCompleted: range };
+}
+
+async function ensureTenant(req) {
+  if (req.tenant) return req.tenant;
+  const env = require('../../config/env');
+  let t = await Tenant.findOne({ tenantCode: env.api.defaultTenantCode });
+  if (!t) t = await Tenant.create({ tenantCode: env.api.defaultTenantCode, name: 'EnviroMaster NRV', reportingTimezone: env.reporting.timezone, currency: 'USD', fiscalYearStartMonth: 1, active: true });
+  return t;
+}
+
+const TTL_MS = 300000;
+function makeCache() {
+  const m = new Map();
+  return {
+    get(k) { const e = m.get(k); if (e && Date.now() - e.at < TTL_MS) return e.v; if (e) m.delete(k); return null; },
+    set(k, v) { m.set(k, { at: Date.now(), v }); if (m.size > 40) m.delete(m.keys().next().value); },
+  };
+}
+const stopsCache = makeCache();
+const pairCache = makeCache();
+const payloadCache = makeCache();
+
+async function getAllStops(from, to) {
+  const key = `${from || ''}|${to || ''}`;
+  const cached = stopsCache.get(key);
+  if (cached) return cached;
+
+  const db = getSourceDb();
+  const and = [CLOSED];
+  const pre = datePrefilter(from, to);
+  if (pre) and.push(pre);
+  const docs = (await db.collection('routestarinvoices')
+    .find({ $and: and }, { projection: { _id: 0, invoiceNumber: 1, 'customer.name': 1, 'customer.link': 1, assignedTo: 1, dateCompleted: 1, invoiceDate: 1, arrivalTime: 1, departureTime: 1 } })
+    .batchSize(5000)
+    .limit(50000).toArray()).filter((d) => inFilterRange(d, from, to));
+
+  const stops = [];
+  for (const d of docs) {
+    const dk = filterDayKey(d) || dayKey(d.dateCompleted || d.invoiceDate);
+    if (!dk) continue;
+    if (from && dk < from) continue;
+    if (to && dk > to) continue;
+    const rc = clean(d.assignedTo) ? String(d.assignedTo).trim().toUpperCase() : '(unassigned)';
+    stops.push({
+      routeCode: rc, dateKey: dk,
+      invoiceNumber: d.invoiceNumber,
+      customer: (d.customer && d.customer.name) || '',
+      cid: customerIdFromLink(d.customer && d.customer.link) || null,
+      arrival: clean(d.arrivalTime) || null,
+      departure: clean(d.departureTime) || null,
+      arrTs: parseTs(d.arrivalTime, dk),
+      depTs: parseTs(d.departureTime, dk),
+    });
+  }
+  stopsCache.set(key, stops);
+  return stops;
+}
+
+async function getStops(from, to, routeCode) {
+  const all = await getAllStops(from, to);
+  return routeCode ? all.filter((s) => s.routeCode === routeCode) : all;
+}
+
+async function getPairMaps(tenantId, names, ids) {
+  const byName = new Map();
+  const byId = new Map();
+  if (!tenantId) return { byName, byId };
+  const or = [];
+  if (Array.isArray(names) && names.length) or.push({ fromCompany: { $in: names }, toCompany: { $in: names } });
+  if (Array.isArray(ids) && ids.length) or.push({ fromCustomerId: { $in: ids }, toCustomerId: { $in: ids } });
+  const q = { tenantId, drivingMinutes: { $ne: null } };
+  if (or.length) q.$or = or;
+  const pairs = await CompanyDistance.find(
+    q,
+    { fromCompany: 1, toCompany: 1, fromCustomerId: 1, toCustomerId: 1, drivingMinutes: 1, distanceMiles: 1 },
+  ).lean();
+  for (const p of pairs) {
+    const a = normName(p.fromCompany); const b = normName(p.toCompany);
+    if (a && b) {
+      if (!byName.has(`${a}||${b}`)) byName.set(`${a}||${b}`, p);
+      if (!byName.has(`${b}||${a}`)) byName.set(`${b}||${a}`, p);
+    }
+    const fa = p.fromCustomerId; const fb = p.toCustomerId;
+    if (fa && fb) {
+      if (!byId.has(`${fa}||${fb}`)) byId.set(`${fa}||${fb}`, p);
+      if (!byId.has(`${fb}||${fa}`)) byId.set(`${fb}||${fa}`, p);
+    }
+  }
+  return { byName, byId };
+}
+
+async function options(req, res) {
+  const cached = payloadCache.get('options');
+  if (cached) { res.set('X-Cache', 'HIT'); return res.json(cached); }
+  const db = getSourceDb();
+  const tenant = await ensureTenant(req);
+  const [routesRaw, agg, pending] = await Promise.all([
+    db.collection('routestarinvoices').distinct('assignedTo', CLOSED),
+    db.collection('routestarinvoices').aggregate([
+      { $match: CLOSED },
+      { $group: { _id: null, maxC: { $max: '$dateCompleted' }, maxI: { $max: '$invoiceDate' }, minC: { $min: '$dateCompleted' }, minI: { $min: '$invoiceDate' } } },
+    ]).toArray(),
+    CompanyDistance.countDocuments({ tenantId: tenant._id, drivingMinutes: null }),
+  ]);
+  const routeCodes = [...new Set((routesRaw || []).map((r) => (clean(r) ? String(r).trim().toUpperCase() : null)).filter(Boolean))].sort();
+  const md = agg[0] || {};
+  const maxDate = md.maxC || md.maxI;
+  const minDate = md.minC || md.minI;
+  const payload = buildEnvelope({ routeCodes, earliestDate: dayKey(minDate), latestDate: dayKey(maxDate), pendingPairs: pending });
+  payloadCache.set('options', payload);
+  res.set('X-Cache', 'MISS');
+  res.json(payload);
+}
+
+function buildPayload(stops, maps, from, to, routeCode) {
+  const groups = new Map();
+  for (const s of stops) {
+    const k = `${s.routeCode}||${s.dateKey}`;
+    if (!groups.has(k)) groups.set(k, { routeCode: s.routeCode, date: s.dateKey, stops: [] });
+    groups.get(k).stops.push(s);
+  }
+
+  const data = [...groups.values()].map((g) => {
+    g.stops.sort((a, b) => (a.arrTs ?? a.depTs ?? Infinity) - (b.arrTs ?? b.depTs ?? Infinity));
+    const legs = [];
+    for (let i = 0; i < g.stops.length - 1; i++) {
+      const cur = g.stops[i]; const nxt = g.stops[i + 1];
+      const observed = signedMinutesBetween(cur.depTs, nxt.arrTs);
+      const sameCustomer = (cur.cid && nxt.cid && cur.cid === nxt.cid)
+        || (normName(cur.customer) && normName(cur.customer) === normName(nxt.customer));
+      let driving = null; let distance = null;
+      if (sameCustomer) {
+        driving = 0; distance = 0;
+      } else {
+        const pair = (cur.cid && nxt.cid && maps.byId.get(`${cur.cid}||${nxt.cid}`))
+          || maps.byName.get(`${normName(cur.customer)}||${normName(nxt.customer)}`);
+        driving = pair && pair.drivingMinutes != null ? pair.drivingMinutes : null;
+        distance = pair && pair.distanceMiles != null ? pair.distanceMiles : null;
+      }
+      const extra = (observed != null && driving != null) ? round(observed - driving, 1) : null;
+      let status = 'ok';
+      if (cur.depTs == null || nxt.arrTs == null) status = 'missing_times';
+      else if (observed < 0) status = 'negative_gap';
+      else if (sameCustomer) status = 'same_location';
+      else if (driving == null) status = 'pending_sync';
+      legs.push({
+        fromInvoiceNumber: cur.invoiceNumber, toInvoiceNumber: nxt.invoiceNumber,
+        fromCustomer: cur.customer, toCustomer: nxt.customer,
+        fromDeparture: cur.departure, toArrival: nxt.arrival,
+        observedGapMinutes: observed != null ? round(observed, 1) : null,
+        drivingMinutes: driving, distanceMiles: distance, extraTimeMinutes: extra, status,
+      });
+    }
+    const usable = legs.filter((x) => x.drivingMinutes != null);
+    return {
+      routeCode: g.routeCode, date: g.date, legCount: legs.length, syncedLegs: usable.length,
+      invoiceNumbers: g.stops.map((s) => s.invoiceNumber).filter(Boolean),
+      stopCount: g.stops.length,
+      drivingMinutes: round(usable.reduce((t, x) => t + (x.drivingMinutes || 0), 0)),
+      observedGapMinutes: round(usable.reduce((t, x) => t + (x.observedGapMinutes || 0), 0)),
+      extraTimeMinutes: round(usable.reduce((t, x) => t + (x.extraTimeMinutes || 0), 0)),
+      distanceMiles: round(usable.reduce((t, x) => t + (x.distanceMiles || 0), 0), 2),
+      legs,
+    };
+  }).filter((g) => g.legCount > 0)
+    .sort((a, b) => (b.date || '').localeCompare(a.date || '') || String(a.routeCode).localeCompare(b.routeCode));
+
+  return buildEnvelope(data, { meta: { source: 'inventory_db + bi_companydistances', from: from || null, to: to || null, routeCode: routeCode || null } });
+}
+
+async function getFullData(req, from, to, routeCode) {
+  const key = `rdtfull|${from || ''}|${to || ''}|${routeCode || ''}`;
+  const cached = payloadCache.get(key);
+  if (cached) return cached;
+  const tenant = await ensureTenant(req);
+  const stops = await getStops(from, to, routeCode);
+  const names = [...new Set(stops.map((s) => s.customer).filter(Boolean))];
+  const ids = [...new Set(stops.map((s) => s.cid).filter(Boolean))];
+  const maps = await getPairMaps(tenant._id, names, ids);
+  const data = buildPayload(stops, maps, from, to, routeCode).data;
+  payloadCache.set(key, data);
+  return data;
+}
+
+async function routeDriveTime(req, res) {
+  const from = clean(req.query.from);
+  const to = clean(req.query.to);
+  const routeCode = (clean(req.query.routeCode) || '').toUpperCase() || undefined;
+
+  const data = await getFullData(req, from, to, routeCode);
+  const slim = data.map(({ legs, ...rest }) => rest);
+
+  let legs = 0; let driving = 0; let observed = 0; let extra = 0; let distance = 0; let syncedLegs = 0;
+  const prMap = new Map();
+  for (const g of slim) {
+    legs += g.legCount || 0; driving += g.drivingMinutes || 0; observed += g.observedGapMinutes || 0;
+    extra += g.extraTimeMinutes || 0; distance += g.distanceMiles || 0; syncedLegs += g.syncedLegs || 0;
+    const a = prMap.get(g.routeCode) || { routeCode: g.routeCode, driving: 0, extra: 0, distance: 0, legs: 0 };
+    a.driving += g.drivingMinutes || 0; a.extra += g.extraTimeMinutes || 0; a.distance += g.distanceMiles || 0; a.legs += g.legCount || 0;
+    prMap.set(g.routeCode, a);
+  }
+  const kpis = { legs, driving, observed, extra, distance, avgExtra: legs ? round(extra / legs, 1) : 0, syncedLegs, unsyncedLegs: legs - syncedLegs };
+  const perRoute = [...prMap.values()].sort((a, b) => b.extra - a.extra);
+
+  const paging = getPaging(req.query, { defaultPageSize: 25, maxPageSize: 200 });
+  const term = clean(req.query.q);
+  let list = slim;
+  if (term) {
+    const t = String(term).toLowerCase();
+    list = slim.filter((g) => Object.values(g).some((v) => {
+      if (v == null || typeof v === 'object') return Array.isArray(v) ? v.some((x) => String(x).toLowerCase().includes(t)) : false;
+      return String(v).toLowerCase().includes(t);
+    }));
+  }
+  const total = list.length;
+  const summary = sliceArray(list, paging);
+  res.set('X-Cache', 'MISS');
+  res.json(buildEnvelope(
+    { kpis, perRoute, summary },
+    { meta: { source: 'inventory_db + bi_companydistances', from: from || null, to: to || null, routeCode: routeCode || null }, page: pageMeta(total, paging, summary.length) },
+  ));
+}
+
+async function routeDriveLegs(req, res) {
+  const from = clean(req.query.from);
+  const to = clean(req.query.to);
+  const routeCode = (clean(req.query.routeCode) || '').toUpperCase() || undefined;
+  const term = clean(req.query.q);
+  const data = await getFullData(req, from, to, routeCode);
+  let flat = [];
+  for (const g of data) for (const l of g.legs || []) flat.push({ ...l, routeCode: g.routeCode, date: g.date });
+  flat.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(a.fromInvoiceNumber || '').localeCompare(String(b.fromInvoiceNumber || '')));
+  if (term) {
+    const t = term.toLowerCase();
+    flat = flat.filter((l) => `${l.fromInvoiceNumber || ''} ${l.toInvoiceNumber || ''} ${l.fromCustomer || ''} ${l.toCustomer || ''} ${l.routeCode || ''} ${l.status || ''}`.toLowerCase().includes(t));
+  }
+  const paging = getPaging(req.query, { defaultPageSize: 25, maxPageSize: 200 });
+  const total = flat.length;
+  const pageRows = sliceArray(flat, paging);
+  res.set('X-Cache', 'MISS');
+  res.json(buildEnvelope(pageRows, { meta: { source: 'inventory_db + bi_companydistances', from: from || null, to: to || null, routeCode: routeCode || null }, page: pageMeta(total, paging, pageRows.length) }));
+}
+
+function commonRanges() {
+  const d = new Date();
+  const iso = (x) => `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
+  const today = iso(d);
+  const week = new Date(d); week.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return [
+    { from: `${d.getFullYear()}-01-01`, to: today },
+    { from: iso(new Date(d.getFullYear(), d.getMonth(), 1)), to: today },
+    { from: iso(new Date(d.getFullYear(), Math.floor(d.getMonth() / 3) * 3, 1)), to: today },
+    { from: iso(week), to: today },
+  ];
+}
+
+let warming = false;
+async function warm() {
+  if (warming) return;
+  warming = true;
+  try {
+    const env = require('../../config/env');
+    const t = await Tenant.findOne({ tenantCode: env.api.defaultTenantCode });
+    if (!t) return;
+    for (const r of commonRanges()) {
+      try {
+        const stops = await getStops(r.from, r.to, undefined);
+        const names = [...new Set(stops.map((s) => s.customer).filter(Boolean))];
+        const ids = [...new Set(stops.map((s) => s.cid).filter(Boolean))];
+        const maps = await getPairMaps(t._id, names, ids);
+        const data = buildPayload(stops, maps, r.from, r.to, undefined).data;
+        payloadCache.set(`rdtfull|${r.from}|${r.to}|`, data);
+      } catch (e) {}
+    }
+  } catch (e) {} finally { warming = false; }
+}
+
+function startWarmer() {
+  setTimeout(() => { warm(); }, 5000);
+  setInterval(() => { warm(); }, TTL_MS - 30000);
+}
+
+module.exports = { options, routeDriveTime, routeDriveLegs, warm, startWarmer };
